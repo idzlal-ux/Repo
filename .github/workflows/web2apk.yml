@@ -1,0 +1,243 @@
+name: Web2APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      web_url:
+        description: "URL website (disarankan HTTPS)"
+        required: true
+        type: string
+      app_name:
+        description: "Nama aplikasi"
+        required: true
+        type: string
+      icon_url:
+        description: "URL langsung ke file ikon PNG/JPG"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      WEB_URL: ${{ inputs.web_url }}
+      APP_NAME: ${{ inputs.app_name }}
+      ICON_URL: ${{ inputs.icon_url }}
+
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from urllib.parse import urlparse
+          for key in ('WEB_URL', 'ICON_URL'):
+              value = os.environ.get(key, '').strip()
+              parsed = urlparse(value)
+              if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+                  raise SystemExit(f'{key} harus berupa URL http:// atau https:// yang valid')
+          if not os.environ.get('APP_NAME', '').strip():
+              raise SystemExit('APP_NAME tidak boleh kosong')
+          PY
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.41.9"
+          cache: true
+
+      - name: Create Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="$(python - <<'PY'
+          import os, re
+          name = os.environ['APP_NAME'].lower()
+          name = re.sub(r'[^a-z0-9_]+', '_', name).strip('_')
+          if not name or not name[0].isalpha(): name = 'web_app_' + name
+          print(name[:50])
+          PY
+          )"
+          flutter create --org com.webapk --project-name "$PKG" myapp
+
+      - name: Add dependencies and register icon asset
+        working-directory: myapp
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub add webview_flutter connectivity_plus flutter_launcher_icons
+          mkdir -p assets/icon
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('pubspec.yaml')
+          text = p.read_text()
+          marker = '  uses-material-design: true'
+          if marker not in text:
+              raise SystemExit('Tidak menemukan konfigurasi flutter: uses-material-design di pubspec.yaml')
+          text = text.replace(marker, marker + '\n  assets:\n    - assets/icon/icon.png', 1)
+          p.write_text(text)
+          PY
+
+      - name: Download and validate app icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y imagemagick
+          curl --fail --location --silent --show-error --retry 3 "$ICON_URL" --output "$RUNNER_TEMP/icon_source"
+          if [[ ! -s "$RUNNER_TEMP/icon_source" ]]; then echo "File ikon kosong"; exit 1; fi
+          mkdir -p myapp/assets/icon
+          convert "$RUNNER_TEMP/icon_source" -background none -gravity center -resize 1024x1024 -extent 1024x1024 PNG32:myapp/assets/icon/icon.png
+
+      - name: Write launcher icon configuration
+        working-directory: myapp
+        run: |
+          cat > flutter_launcher_icons.yaml <<'YAML'
+          flutter_launcher_icons:
+            android: true
+            ios: false
+            image_path: assets/icon/icon.png
+            min_sdk_android: 21
+          YAML
+
+      - name: Write WebView app
+        working-directory: myapp
+        shell: bash
+        run: |
+          cat > lib/main.dart <<'DART'
+          import 'dart:async';
+          import 'package:connectivity_plus/connectivity_plus.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          const appName = String.fromEnvironment('APP_NAME', defaultValue: 'Web App');
+          const websiteUrl = String.fromEnvironment('WEB_URL', defaultValue: 'https://example.com');
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+              statusBarColor: Colors.transparent,
+              statusBarIconBrightness: Brightness.dark,
+            ));
+            runApp(const WebApp());
+          }
+
+          class WebApp extends StatelessWidget {
+            const WebApp({super.key});
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+              title: appName,
+              debugShowCheckedModeBanner: false,
+              theme: ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xFF3478F6)),
+              home: const WebHome(),
+            );
+          }
+
+          class WebHome extends StatefulWidget {
+            const WebHome({super.key});
+            @override
+            State<WebHome> createState() => _WebHomeState();
+          }
+
+          class _WebHomeState extends State<WebHome> {
+            late final WebViewController controller;
+            StreamSubscription<List<ConnectivityResult>>? subscription;
+            bool loading = true;
+            bool dialogVisible = false;
+
+            @override
+            void initState() {
+              super.initState();
+              controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setNavigationDelegate(NavigationDelegate(
+                  onPageStarted: (_) { if (mounted) setState(() => loading = true); },
+                  onPageFinished: (_) { if (mounted) setState(() => loading = false); },
+                  onWebResourceError: (error) {
+                    if (error.isForMainFrame == true) _showNetworkDialog('Halaman gagal dimuat. Periksa koneksi atau URL website.');
+                  },
+                ))
+                ..loadRequest(Uri.parse(websiteUrl));
+              subscription = Connectivity().onConnectivityChanged.listen((results) {
+                if (results.every((r) => r == ConnectivityResult.none)) {
+                  _showNetworkDialog('Tidak ada koneksi internet. Periksa jaringan lalu coba lagi.');
+                }
+              });
+            }
+
+            void _showNetworkDialog(String message) {
+              if (!mounted || dialogVisible) return;
+              dialogVisible = true;
+              showDialog<void>(
+                context: context,
+                barrierDismissible: false,
+                builder: (dialogContext) => AlertDialog(
+                  title: const Row(children: [Icon(Icons.wifi_off, color: Colors.red), SizedBox(width: 8), Text('Koneksi bermasalah')]),
+                  content: Text(message),
+                  actions: [TextButton(onPressed: () { Navigator.of(dialogContext).pop(); dialogVisible = false; controller.reload(); }, child: const Text('Coba lagi'))],
+                ),
+              ).whenComplete(() { dialogVisible = false; });
+            }
+
+            @override
+            void dispose() { subscription?.cancel(); super.dispose(); }
+
+            @override
+            Widget build(BuildContext context) => PopScope(
+              canPop: false,
+              onPopInvokedWithResult: (didPop, result) async {
+                if (didPop) return;
+                if (await controller.canGoBack()) { await controller.goBack(); }
+                else { SystemNavigator.pop(); }
+              },
+              child: Scaffold(
+                body: SafeArea(child: Stack(children: [
+                  WebViewWidget(controller: controller),
+                  if (loading) const LinearProgressIndicator(minHeight: 2),
+                ])),
+              ),
+            );
+          }
+          DART
+          flutter pub get
+          dart run flutter_launcher_icons -f flutter_launcher_icons.yaml
+
+      - name: Set Android app label and Internet permission
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, re
+          from pathlib import Path
+          p = Path('myapp/android/app/src/main/AndroidManifest.xml')
+          text = p.read_text()
+          name = os.environ['APP_NAME'].replace('&', '&amp;').replace('"', '&quot;').replace('<', '&lt;')
+          text = re.sub(r'android:label="[^"]*"', 'android:label="' + name + '"', text, count=1)
+          if 'android.permission.INTERNET' not in text:
+              text = text.replace('<application', '<uses-permission android:name="android.permission.INTERNET" />\n    <application', 1)
+          p.write_text(text)
+          PY
+          # Rebuild after updating the manifest label/permission.
+          cd myapp
+          flutter build apk --release --dart-define="APP_NAME=$APP_NAME" --dart-define="WEB_URL=$WEB_URL"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web2apk-release
+          path: myapp/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 7
